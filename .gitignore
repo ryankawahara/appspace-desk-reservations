@@ -2,3 +2,8 @@
 desk_reservation.log
 *.log
 USER_CONFIGS.json
+
+# MCP Server
+node_modules/
+mcp-server/node_modules/
+mcp-server/dist/

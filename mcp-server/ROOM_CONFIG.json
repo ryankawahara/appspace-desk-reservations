@@ -1,0 +1,87 @@
+{
+  "_comment": "Room naming configuration for 7 Hudson Square conference rooms",
+  "building": {
+    "name": "7 Hudson Square",
+    "prefix": "!CR NYNY 7 HUDSON",
+    "networkId": "be66108b-8a13-4237-a0a0-3db048d4d23f"
+  },
+  "floors": {
+    "4": {
+      "name": "Floor 4",
+      "wings": ["W"],
+      "pattern": "04"
+    },
+    "5": {
+      "name": "Floor 5",
+      "wings": ["E", "W"],
+      "pattern": "05"
+    },
+    "6": {
+      "name": "Floor 6",
+      "wings": ["E", "W"],
+      "pattern": "06"
+    },
+    "7": {
+      "name": "Floor 7",
+      "wings": ["E", "W"],
+      "pattern": "07"
+    },
+    "8": {
+      "name": "Floor 8",
+      "wings": ["E", "W"],
+      "pattern": "08"
+    },
+    "9": {
+      "name": "Floor 9",
+      "wings": ["E", "W"],
+      "pattern": "09"
+    }
+  },
+  "shortcuts": {
+    "4": "04",
+    "4W": "04W",
+    "5": "05",
+    "5E": "05E",
+    "5W": "05W",
+    "6": "06",
+    "6E": "06E",
+    "6W": "06W",
+    "7": "07",
+    "7E": "07E",
+    "7W": "07W",
+    "8": "08",
+    "8E": "08E",
+    "8W": "08W",
+    "9": "09",
+    "9E": "09E",
+    "9W": "09W"
+  },
+  "floorIds": {
+    "_comment": "Floor IDs from Appspace API. Floors 4-9 have single IDs (E/W filtering done by room name). Floors 10+ have separate E/W IDs.",
+    "04": "fba00010-93bc-4876-a889-2d57c1478e87",
+    "05": "de11a9d3-8eb0-484f-a31e-22f8c7d583d7",
+    "06": "46644705-3961-49f4-8d6b-7acd52afdfae",
+    "07": "4dad5356-518c-4b24-b8df-99c0e135e5fb",
+    "08": "e9be9691-6d5a-4d14-8f5a-a049df55b95b",
+    "09": "a1099b60-6694-4653-b907-47f98bd6cdfc",
+    "10": "3cd18833-ed46-4bd0-8bbb-fcd2e48b4c3c",
+    "11E": "7e4bf330-2650-4e89-8560-cdf3b9e9d277",
+    "11W": "e493bcd4-36bf-4699-8d07-f42eb7c84832",
+    "12E": "cebd03ac-54fd-4622-9dd2-10819863080f",
+    "12W": "cba42b45-b132-4ff6-a6ac-36794b7160fb",
+    "13E": "20593197-29b7-4198-8c7e-a0827972f982",
+    "14E": "536ef202-9b8b-46a7-9d8c-3074773f8049",
+    "14W": "9cf16e85-d9a3-4923-ab82-d2c913a3ed1c",
+    "15E": "1a0e35f4-0372-4075-90e3-2151cd2e43d3",
+    "15W": "e941a323-8239-4d81-8dcc-8a628af4f4af",
+    "16E": "105fed57-ada3-4ea7-a503-4e60d73a593a",
+    "16W": "81fbb807-88fd-40fb-857a-6745df30b75f",
+    "17E": "63b0eb8e-d717-462b-bc8f-c06179bcf427",
+    "17W": "06ba2c77-e353-4728-80c8-1095865526d8",
+    "C1": "aeb85e12-6769-4f51-85c8-15694c203ed1",
+    "C2": "75b81a19-17c5-4661-ab01-4f05d2428f78"
+  }
+}
+
+
+
