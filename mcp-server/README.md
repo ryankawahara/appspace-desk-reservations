@@ -213,16 +213,18 @@ Early checkout from a reservation.
 
 ---
 
-### `check_availability`
-Check availability of conference rooms by floor or specific rooms.
+### `check_meeting_availability`
+Check availability of conference rooms and huddle spaces by floor. Includes a text-based floor map by default.
 
 **Parameters:**
-- `floor`: Floor shortcut to check all rooms (e.g., "8", "8W", "8E", "9W"). Supported floors: 4-9.
-- `resources`: Array of specific resource names or IDs
-- `date` (required): Date to check (YYYY-MM-DD, "today", "tomorrow")
+- `floor`: Floor shortcut (e.g., "8", "8W", "8E"). Auto-detected from your desk reservation if not provided.
+- `date`: Date to check (YYYY-MM-DD, "today", "tomorrow"). Defaults to today.
 - `startTime` (required): Start time in HH:MM format
-- `endTime` (required): End time in HH:MM format
+- `duration`: Meeting duration in minutes (e.g., 30, 60, 90). Use this OR endTime.
+- `endTime`: End time in HH:MM format. Use this OR duration.
+- `resources`: Array of specific resource names or IDs
 - `location`: Full location prefix to match
+- `skipMap`: Skip generating the ASCII floor map (default: false)
 
 **Floor Shortcuts:**
 | Shortcut | Matches |
@@ -232,12 +234,43 @@ Check availability of conference rooms by floor or specific rooms.
 | `8E` | Floor 8 East rooms only |
 | `9`, `9W`, `9E` | Floor 9 rooms |
 | `7`, `7W`, `7E` | Floor 7 rooms |
-| etc. | Floors 4-9 supported |
+| etc. | Floors 4-17 supported |
 
 **Examples:**
 - "What rooms are available on 8W at 3pm today?"
 - "Check availability for floor 8 from 2-3pm tomorrow"
 - "Are any 9E conference rooms free at 10am?"
+- "Find a huddle room for a 30-minute meeting at 2pm"
+
+---
+
+### `batch_check_availability`
+Check meeting room availability across multiple days and times in a single call. Returns a summary table showing availability patterns.
+
+**Parameters:**
+- `floor`: Floor shortcut (e.g., "8W"). Auto-detected if not provided.
+- `dates`: Array of dates to check (YYYY-MM-DD). Defaults to next 5 weekdays.
+- `times`: Array of start times (HH:MM). Defaults to hourly 9am-5pm.
+- `duration`: Meeting duration in minutes (default: 30)
+
+**Examples:**
+- "Show me room availability for next week"
+- "What's the availability like on 8W this week?"
+
+---
+
+### `get_availability_stats`
+Generate visual text-based charts showing meeting room availability patterns. Shows heatmaps, bar charts, and recommendations. Excludes Fridays by default.
+
+**Parameters:**
+- `floor`: Floor shortcut (e.g., "8W"). Auto-detected if not provided.
+- `duration`: Meeting duration in minutes (default: 30)
+- `includeFriday`: Include Friday in stats (default: false)
+
+**Examples:**
+- "Show me availability stats for next week"
+- "What are the best times to book meetings?"
+- "Room availability heatmap for floor 8"
 
 ---
 

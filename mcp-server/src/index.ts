@@ -1053,6 +1053,624 @@ async function getUserFloorForDate(targetDate: string): Promise<{ floor: string;
   return null;
 }
 
+// ============================================================================
+// DYNAMIC FLOOR DATA - Fetched from Appspace GeoJSON API
+// ============================================================================
+
+interface RoomCoords {
+  x1: number; y1: number; x2: number; y2: number;
+  type: 'conf' | 'huddle';
+  cx: number; cy: number;
+  name: string;
+  wing: 'E' | 'W' | null;
+}
+
+interface DeskCoords {
+  cx: number; cy: number;
+  name: string;
+  wing: 'E' | 'W' | null;
+}
+
+interface FloorGeoData {
+  rooms: Record<string, RoomCoords>;
+  desks: Record<string, DeskCoords>;
+  svgWidth: number;
+  svgHeight: number;
+  fetchedAt: number;
+}
+
+// Cache for floor GeoJSON data (keyed by floorId)
+const floorGeoDataCache: Record<string, FloorGeoData> = {};
+
+/**
+ * Fetch and parse GeoJSON data for a floor from Appspace API
+ */
+async function fetchFloorGeoData(
+  floorId: string,
+  layerSettingId: string,
+  token: string,
+  host: string
+): Promise<FloorGeoData | null> {
+  // Check cache (valid for 1 hour)
+  const cached = floorGeoDataCache[floorId];
+  if (cached && Date.now() - cached.fetchedAt < 3600000) {
+    return cached;
+  }
+
+  try {
+    const rooms: Record<string, RoomCoords> = {};
+    const desks: Record<string, DeskCoords> = {};
+    let page = 1;
+    let hasMore = true;
+
+    // Fetch all pages of GeoJSON data
+    while (hasMore && page <= 10) {
+      const url = `https://${host}/api/v3/maps/floors/${floorId}/layers/settings/${layerSettingId}/nodes/settings?start=0&page=${page}&limit=250&pagecount=250`;
+      
+      const response = await fetch(url, {
+        headers: {
+          'accept': 'application/json',
+          'token': token,
+        },
+      });
+
+      if (!response.ok) break;
+      
+      const data = await response.json();
+      if (!data.items || data.items.length === 0) break;
+
+      for (const item of data.items) {
+        const name = item.setting?.name;
+        const subType = item.setting?.subType;
+        const coords = item.geoJSON?.geometry?.coordinates?.[0];
+        
+        if (!name || !coords || coords.length === 0) continue;
+
+        // Extract bounding box from polygon coordinates
+        const xs = coords.flat().filter((_: number, i: number) => i % 2 === 0);
+        const ys = coords.flat().filter((_: number, i: number) => i % 2 === 1);
+        const x1 = Math.min(...xs);
+        const y1 = Math.min(...ys);
+        const x2 = Math.max(...xs);
+        const y2 = Math.max(...ys);
+        const cx = (x1 + x2) / 2;
+        const cy = (y1 + y2) / 2;
+
+        // Determine wing from name (e.g., "08W-134" -> "W")
+        const wingMatch = name.match(/\d{2}([EW])-/);
+        const wing = wingMatch ? wingMatch[1] as 'E' | 'W' : null;
+
+        // Extract room number (e.g., "08W-134" -> "134")
+        const roomNumMatch = name.match(/\d{2}[EW]?-(\d+)(?:-[A-Z])?$/);
+        const roomNum = roomNumMatch ? roomNumMatch[1] : null;
+
+        if (subType === 'VideoConferenceRoom' || subType === 'HuddleSpace') {
+          // It's a room - skip individual desk entries (those with -A, -B, etc.)
+          if (name.match(/-[A-Z]$/)) continue;
+          
+          const isConf = subType === 'VideoConferenceRoom';
+          if (roomNum) {
+            rooms[roomNum] = {
+              x1, y1, x2, y2, cx, cy,
+              type: isConf ? 'conf' : 'huddle',
+              name: roomNum,
+              wing,
+            };
+          }
+        } else if (subType === 'Desk') {
+          // It's a desk
+          desks[name] = { cx, cy, name, wing };
+        }
+      }
+
+      hasMore = data.items.length === 250;
+      page++;
+    }
+
+    const geoData: FloorGeoData = {
+      rooms,
+      desks,
+      svgWidth: 721, // Standard floor width
+      svgHeight: 385, // Standard floor height
+      fetchedAt: Date.now(),
+    };
+
+    floorGeoDataCache[floorId] = geoData;
+    return geoData;
+
+  } catch (error) {
+    console.error(`Failed to fetch floor geo data: ${error}`);
+    return null;
+  }
+}
+
+// Get user desk coordinates from cached floor data or static fallback
+function getUserDeskCoords(deskName: string | null, floorGeoData?: FloorGeoData | null): { cx: number; cy: number } | null {
+  if (!deskName) return null;
+  
+  // Try dynamic data first
+  if (floorGeoData?.desks[deskName]) {
+    const desk = floorGeoData.desks[deskName];
+    return { cx: desk.cx, cy: desk.cy };
+  }
+  
+  // Static fallback for Floor 08W (commonly used)
+  const FLOOR_08W_DESKS: Record<string, { cx: number; cy: number }> = {
+    '08W-119-A': { cx: 48, cy: 243 }, '08W-119-B': { cx: 38, cy: 243 }, '08W-119-C': { cx: 28, cy: 243 },
+    '08W-119-D': { cx: 18, cy: 243 }, '08W-119-E': { cx: 8, cy: 243 },
+    '08W-119-F': { cx: 48, cy: 249 }, '08W-119-G': { cx: 38, cy: 249 }, '08W-119-H': { cx: 28, cy: 249 },
+    '08W-121-A': { cx: 52, cy: 266 }, '08W-121-C': { cx: 34, cy: 271 }, '08W-121-D': { cx: 26, cy: 266 },
+    '08W-123-A': { cx: 53, cy: 296 }, '08W-123-B': { cx: 42, cy: 296 }, '08W-123-C': { cx: 32, cy: 296 },
+    '08W-123-D': { cx: 22, cy: 296 }, '08W-123-E': { cx: 12, cy: 296 },
+    '08W-123-F': { cx: 53, cy: 301 }, '08W-123-G': { cx: 42, cy: 301 }, '08W-123-H': { cx: 32, cy: 301 },
+    '08W-125-A': { cx: 53, cy: 318 }, '08W-125-B': { cx: 42, cy: 318 }, '08W-125-C': { cx: 32, cy: 318 },
+    '08W-125-D': { cx: 22, cy: 318 }, '08W-125-E': { cx: 12, cy: 318 },
+    '08W-125-F': { cx: 53, cy: 324 }, '08W-125-G': { cx: 42, cy: 324 }, '08W-125-H': { cx: 32, cy: 324 },
+    '08W-125-J': { cx: 22, cy: 324 }, '08W-125-K': { cx: 12, cy: 324 },
+    '08W-127-A': { cx: 53, cy: 340 }, '08W-127-B': { cx: 42, cy: 340 }, '08W-127-C': { cx: 32, cy: 340 },
+    '08W-127-D': { cx: 22, cy: 340 }, '08W-127-E': { cx: 12, cy: 340 },
+    '08W-127-F': { cx: 53, cy: 346 }, '08W-127-G': { cx: 42, cy: 346 }, '08W-127-H': { cx: 32, cy: 346 },
+  };
+  
+  // Static fallback for Floor 08E (East wing) - sample desks
+  const FLOOR_08E_DESKS: Record<string, { cx: number; cy: number }> = {
+    // Sample East wing desk coordinates (based on GeoJSON data: x: 399-708, y: 11-374)
+    '08E-301-A': { cx: 420, cy: 150 }, '08E-301-B': { cx: 430, cy: 150 }, '08E-301-C': { cx: 440, cy: 150 },
+    '08E-303-A': { cx: 420, cy: 180 }, '08E-303-B': { cx: 430, cy: 180 }, '08E-303-C': { cx: 440, cy: 180 },
+    '08E-305-A': { cx: 420, cy: 210 }, '08E-305-B': { cx: 430, cy: 210 }, '08E-305-C': { cx: 440, cy: 210 },
+    '08E-307-A': { cx: 510, cy: 150 }, '08E-307-B': { cx: 520, cy: 150 }, '08E-307-C': { cx: 530, cy: 150 },
+    '08E-309-A': { cx: 510, cy: 180 }, '08E-309-B': { cx: 520, cy: 180 }, '08E-309-C': { cx: 530, cy: 180 },
+    '08E-311-A': { cx: 510, cy: 210 }, '08E-311-B': { cx: 520, cy: 210 }, '08E-311-C': { cx: 530, cy: 210 },
+    '08E-313-A': { cx: 600, cy: 150 }, '08E-313-B': { cx: 610, cy: 150 }, '08E-313-C': { cx: 620, cy: 150 },
+    '08E-315-A': { cx: 600, cy: 180 }, '08E-315-B': { cx: 610, cy: 180 }, '08E-315-C': { cx: 620, cy: 180 },
+    '08E-317-A': { cx: 670, cy: 200 }, '08E-317-B': { cx: 680, cy: 200 }, '08E-317-C': { cx: 690, cy: 200 },
+    '08E-319-A': { cx: 670, cy: 230 }, '08E-319-B': { cx: 680, cy: 230 }, '08E-319-C': { cx: 690, cy: 230 },
+  };
+  
+  return FLOOR_08W_DESKS[deskName] || FLOOR_08E_DESKS[deskName] || null;
+}
+
+// Static fallback room data for Floor 08W
+const FLOOR_08W_ROOMS: Record<string, RoomCoords> = {
+  '458': { x1: 71, y1: 68, x2: 94, y2: 85, type: 'huddle', cx: 82, cy: 76, name: '458', wing: 'W' },
+  '460': { x1: 71, y1: 86, x2: 94, y2: 102, type: 'huddle', cx: 82, cy: 93, name: '460', wing: 'W' },
+  '464': { x1: 71, y1: 127, x2: 93, y2: 143, type: 'huddle', cx: 82, cy: 135, name: '464', wing: 'W' },
+  '466': { x1: 71, y1: 144, x2: 93, y2: 160, type: 'huddle', cx: 82, cy: 151, name: '466', wing: 'W' },
+  '182': { x1: 236, y1: 152, x2: 259, y2: 169, type: 'huddle', cx: 247, cy: 160, name: '182', wing: 'W' },
+  '180': { x1: 236, y1: 169, x2: 259, y2: 185, type: 'huddle', cx: 247, cy: 176, name: '180', wing: 'W' },
+  '416': { x1: 327, y1: 149, x2: 344, y2: 172, type: 'huddle', cx: 335, cy: 160, name: '416', wing: 'W' },
+  '414': { x1: 344, y1: 149, x2: 361, y2: 172, type: 'huddle', cx: 352, cy: 160, name: '414', wing: 'W' },
+  '168': { x1: 236, y1: 229, x2: 259, y2: 245, type: 'huddle', cx: 247, cy: 236, name: '168', wing: 'W' },
+  '166': { x1: 236, y1: 246, x2: 259, y2: 262, type: 'huddle', cx: 247, cy: 253, name: '166', wing: 'W' },
+  '164': { x1: 237, y1: 262, x2: 259, y2: 279, type: 'huddle', cx: 247, cy: 270, name: '164', wing: 'W' },
+  '172': { x1: 333, y1: 225, x2: 349, y2: 248, type: 'huddle', cx: 340, cy: 236, name: '172', wing: 'W' },
+  '174': { x1: 350, y1: 225, x2: 365, y2: 248, type: 'huddle', cx: 357, cy: 236, name: '174', wing: 'W' },
+  '134': { x1: 94, y1: 262, x2: 116, y2: 296, type: 'conf', cx: 105, cy: 279, name: '134', wing: 'W' },
+  '136': { x1: 117, y1: 262, x2: 139, y2: 296, type: 'conf', cx: 127, cy: 279, name: '136', wing: 'W' },
+  '138': { x1: 139, y1: 262, x2: 161, y2: 296, type: 'conf', cx: 149, cy: 279, name: '138', wing: 'W' },
+  '140': { x1: 161, y1: 262, x2: 191, y2: 296, type: 'conf', cx: 176, cy: 279, name: '140', wing: 'W' },
+  '142': { x1: 192, y1: 262, x2: 214, y2: 296, type: 'conf', cx: 202, cy: 279, name: '142', wing: 'W' },
+  '144': { x1: 215, y1: 262, x2: 237, y2: 296, type: 'conf', cx: 225, cy: 279, name: '144', wing: 'W' },
+};
+
+// Static fallback room data for Floor 08E (East wing)
+const FLOOR_08E_ROOMS: Record<string, RoomCoords> = {
+  // Conference rooms (top row)
+  '346': { x1: 485, y1: 91, x2: 507, y2: 125, type: 'conf', cx: 496, cy: 108, name: '346', wing: 'E' },
+  '344': { x1: 508, y1: 91, x2: 529, y2: 125, type: 'conf', cx: 518, cy: 108, name: '344', wing: 'E' },
+  '342': { x1: 530, y1: 91, x2: 551, y2: 125, type: 'conf', cx: 540, cy: 108, name: '342', wing: 'E' },
+  '340': { x1: 552, y1: 91, x2: 583, y2: 125, type: 'conf', cx: 567, cy: 108, name: '340', wing: 'E' },
+  '336': { x1: 584, y1: 91, x2: 606, y2: 125, type: 'conf', cx: 595, cy: 108, name: '336', wing: 'E' },
+  '334': { x1: 606, y1: 91, x2: 627, y2: 125, type: 'conf', cx: 616, cy: 108, name: '334', wing: 'E' },
+  // Huddle spaces (left column)
+  '368': { x1: 462, y1: 125, x2: 485, y2: 141, type: 'huddle', cx: 473, cy: 133, name: '368', wing: 'E' },
+  '370': { x1: 462, y1: 142, x2: 485, y2: 158, type: 'huddle', cx: 473, cy: 150, name: '370', wing: 'E' },
+  '208': { x1: 462, y1: 202, x2: 486, y2: 218, type: 'huddle', cx: 474, cy: 210, name: '208', wing: 'E' },
+  '210': { x1: 462, y1: 218, x2: 486, y2: 234, type: 'huddle', cx: 474, cy: 226, name: '210', wing: 'E' },
+  '212': { x1: 462, y1: 235, x2: 486, y2: 251, type: 'huddle', cx: 474, cy: 243, name: '212', wing: 'E' },
+  '214': { x1: 462, y1: 252, x2: 486, y2: 269, type: 'huddle', cx: 474, cy: 260, name: '214', wing: 'E' },
+  // Huddle spaces (right column)
+  '320': { x1: 628, y1: 108, x2: 651, y2: 125, type: 'huddle', cx: 639, cy: 116, name: '320', wing: 'E' },
+  '318': { x1: 628, y1: 125, x2: 651, y2: 141, type: 'huddle', cx: 639, cy: 133, name: '318', wing: 'E' },
+  '316': { x1: 628, y1: 142, x2: 651, y2: 158, type: 'huddle', cx: 639, cy: 150, name: '316', wing: 'E' },
+  '254': { x1: 628, y1: 227, x2: 650, y2: 243, type: 'huddle', cx: 639, cy: 235, name: '254', wing: 'E' },
+  '252': { x1: 628, y1: 244, x2: 650, y2: 260, type: 'huddle', cx: 639, cy: 252, name: '252', wing: 'E' },
+  '246': { x1: 628, y1: 300, x2: 651, y2: 317, type: 'huddle', cx: 639, cy: 308, name: '246', wing: 'E' },
+  '244': { x1: 628, y1: 318, x2: 651, y2: 334, type: 'huddle', cx: 639, cy: 326, name: '244', wing: 'E' },
+  // Center huddle
+  '200': { x1: 421, y1: 225, x2: 437, y2: 248, type: 'huddle', cx: 429, cy: 236, name: '200', wing: 'E' },
+};
+
+/**
+ * Generate a spatially accurate ASCII floor map using actual GeoJSON coordinates.
+ * Uses a grid-based approach where each character represents ~8 pixels.
+ * 
+ * Room coordinates from GeoJSON (verified):
+ * - 458: x=71-94, y=68-85    - 460: x=71-94, y=86-102
+ * - 464: x=71-93, y=127-143  - 466: x=71-93, y=144-160
+ * - 416: x=327-344, y=149-172 - 414: x=344-361, y=149-172
+ * - 182: x=236-259, y=152-169 - 180: x=236-259, y=169-185
+ * - 172: x=333-349, y=225-248 - 174: x=350-365, y=225-248
+ * - 168: x=236-259, y=229-245 - 166: x=236-259, y=246-262
+ * - 134-144: x=94-237, y=262-296 (conference row)
+ * - 164: x=237-259, y=262-279
+ */
+function generateTextFloorMap(options: {
+  availableConf: string[];
+  unavailableConf: string[];
+  availableHuddle: string[];
+  unavailableHuddle: string[];
+  userDesk: string | null;
+  wingFilter: string | null;
+  baseFloor: string;
+  floorGeoData?: FloorGeoData | null;
+}): string {
+  const { availableConf, unavailableConf, availableHuddle, unavailableHuddle, userDesk, wingFilter, baseFloor, floorGeoData } = options;
+  
+  // Determine wing first for fallback selection
+  const detectedWing = userDesk?.match(/\d{2}([EW])-/)?.[1] || wingFilter || 'W';
+  
+  // Use dynamic geo data if available, otherwise fall back to static data for floor 08
+  const getStaticRoomData = () => {
+    if (baseFloor !== '08') return null;
+    // Combine both wing data, filtering will happen later
+    return { ...FLOOR_08W_ROOMS, ...FLOOR_08E_ROOMS };
+  };
+  const roomData = floorGeoData?.rooms || getStaticRoomData();
+  
+  // Only generate spatial map if we have room data and it's a supported floor/wing
+  if (!roomData || Object.keys(roomData).length === 0) {
+    return generateSimpleFloorMap(options);
+  }
+  
+  const allAvailable = new Set([...availableConf, ...availableHuddle].map(r => r.replace(/^\d{2}[EW]-/, '')));
+  const allUnavailable = new Set([...unavailableConf, ...unavailableHuddle].map(r => r.replace(/^\d{2}[EW]-/, '')));
+  
+  // Get user desk coordinates
+  const userDeskCoords = getUserDeskCoords(userDesk, floorGeoData);
+  const userDeskShort = userDesk?.replace(/^\d{2}[EW]-/, '') || '';
+  const floorPrefix = userDesk?.match(/^(\d{2}[EW])-/)?.[1] || `${baseFloor}${wingFilter || ''}`;
+  
+  // Determine which wing to show - explicit wingFilter takes precedence over user's desk
+  // This allows users to view a different wing than where their desk is located
+  const userWing = wingFilter || userDesk?.match(/\d{2}([EW])-/)?.[1] || 'W';
+  const wingLabel = userWing === 'W' ? 'WEST' : 'EAST';
+  
+  // Filter rooms to only show the relevant wing
+  const wingRooms = Object.entries(roomData).filter(([_, room]) => {
+    if (!room.wing) return true; // Include rooms without wing designation
+    return room.wing === userWing;
+  });
+  
+  // Helper to get room status symbol
+  const getStatus = (room: string): string => {
+    if (allAvailable.has(room)) return '✓';
+    if (allUnavailable.has(room)) return '✗';
+    return '·';
+  };
+  
+  // Build grid-based ASCII map
+  // Scale: 1 char = 4 pixels (doubled resolution for better detail)
+  // West wing: 0-450px, East wing: 320-770px (expanded by 50px each direction)
+  const SCALE = 4;
+  const WIDTH = 113;   // 450 / 4 ≈ 113 chars (expanded by ~12 chars)
+  const HEIGHT = 109;  // 435 / 4 ≈ 109 chars (expanded by ~12 chars)
+  const xOffset = userWing === 'E' ? 320 : 0; // Shift for east wing
+  
+  // Initialize grid with spaces
+  const grid: string[][] = Array.from({ length: HEIGHT }, () => Array(WIDTH).fill(' '));
+  
+  // Draw floor boundary
+  for (let x = 0; x < WIDTH; x++) {
+    grid[0][x] = '═';
+    grid[HEIGHT - 1][x] = '═';
+  }
+  for (let y = 0; y < HEIGHT; y++) {
+    grid[y][0] = '║';
+    grid[y][WIDTH - 1] = '║';
+  }
+  grid[0][0] = '╔'; grid[0][WIDTH-1] = '╗';
+  grid[HEIGHT-1][0] = '╚'; grid[HEIGHT-1][WIDTH-1] = '╝';
+  
+  // Track which grid cells belong to rooms (to prevent desk pod overlap)
+  const roomCells = new Set<string>();
+  
+  // Helper to draw a room box with label (only show label for available rooms)
+  const drawRoom = (room: RoomCoords, status: string, isAvailable: boolean) => {
+    // GeoJSON rooms share exact edges (e.g., room A ends at x=139, room B starts at x=139)
+    // We use floor() for start coordinates and floor(end - 1) for end coordinates
+    // This ensures adjacent rooms don't overlap in the grid
+    const cx1 = Math.floor((room.x1 - xOffset) / SCALE);
+    const cy1 = Math.floor(room.y1 / SCALE);
+    // Subtract 1 from end coordinates before dividing to prevent shared-edge overlap
+    const cx2 = Math.floor((room.x2 - 1 - xOffset) / SCALE);
+    const cy2 = Math.floor((room.y2 - 1) / SCALE);
+    
+    if (cx1 < 1 || cx2 >= WIDTH - 1 || cy1 < 1 || cy2 >= HEIGHT - 1) return;
+    if (cx2 <= cx1 || cy2 <= cy1) return; // Skip if room is too small to render
+    
+    // Mark all cells in this room's bounding box as room cells (including interior)
+    for (let y = cy1; y <= cy2; y++) {
+      for (let x = cx1; x <= cx2; x++) {
+        roomCells.add(`${y},${x}`);
+      }
+    }
+    
+    const isConf = room.type === 'conf';
+    // Use dimmer characters for unavailable rooms
+    const hChar = isConf ? (isAvailable ? '═' : '─') : '─';
+    const vChar = isConf ? (isAvailable ? '║' : '│') : '│';
+    const tl = isConf ? (isAvailable ? '╔' : '┌') : '┌';
+    const tr = isConf ? (isAvailable ? '╗' : '┐') : '┐';
+    const bl = isConf ? (isAvailable ? '╚' : '└') : '└';
+    const br = isConf ? (isAvailable ? '╝' : '┘') : '┘';
+    
+    // Helper to check if a cell already has a box character (from another room)
+    const isBoxChar = (c: string) => '─│┌┐└┘═║╔╗╚╝├┤┬┴┼'.includes(c);
+    
+    // Draw top edge - use intersection chars if overlapping another room
+    if (!isBoxChar(grid[cy1][cx1])) grid[cy1][cx1] = tl;
+    for (let x = cx1 + 1; x < cx2; x++) {
+      if (!isBoxChar(grid[cy1][x]) || grid[cy1][x] === '│' || grid[cy1][x] === '║') {
+        grid[cy1][x] = hChar;
+      }
+    }
+    if (!isBoxChar(grid[cy1][cx2])) grid[cy1][cx2] = tr;
+    
+    // Draw side edges
+    for (let y = cy1 + 1; y < cy2; y++) {
+      if (!isBoxChar(grid[y][cx1]) || grid[y][cx1] === '─' || grid[y][cx1] === '═') {
+        grid[y][cx1] = vChar;
+      }
+      if (!isBoxChar(grid[y][cx2]) || grid[y][cx2] === '─' || grid[y][cx2] === '═') {
+        grid[y][cx2] = vChar;
+      }
+    }
+    
+    // Draw bottom edge
+    if (!isBoxChar(grid[cy2][cx1])) grid[cy2][cx1] = bl;
+    for (let x = cx1 + 1; x < cx2; x++) {
+      if (!isBoxChar(grid[cy2][x]) || grid[cy2][x] === '│' || grid[cy2][x] === '║') {
+        grid[cy2][x] = hChar;
+      }
+    }
+    if (!isBoxChar(grid[cy2][cx2])) grid[cy2][cx2] = br;
+    
+    // Only draw room number and status for AVAILABLE rooms
+    if (isAvailable) {
+      const midY = Math.floor((cy1 + cy2) / 2);
+      const midX = Math.floor((cx1 + cx2) / 2);
+      const label = room.name.slice(-3); // Last 3 chars of room number
+      
+      // Place label if there's room
+      if (cx2 - cx1 >= 3) {
+        const startX = midX - 1;
+        for (let i = 0; i < Math.min(3, label.length) && startX + i < cx2; i++) {
+          if (startX + i > cx1) grid[midY][startX + i] = label[i];
+        }
+      }
+      
+      // Place status symbol (✓ for available)
+      if (cy2 - cy1 >= 2 && midY + 1 < cy2) {
+        grid[midY + 1][midX] = status;
+      } else if (midX + 2 < cx2) {
+        grid[midY][midX + 2] = status;
+      }
+    }
+  };
+  
+  // Draw all rooms for this wing
+  for (const [roomNum, room] of wingRooms) {
+    const isAvailable = allAvailable.has(roomNum);
+    drawRoom(room, getStatus(roomNum), isAvailable);
+  }
+  
+  // Draw desk pod areas (shaded) - based on actual desk locations from GeoJSON
+  // Desk pods are concentrated in specific regions, NOT spanning entire floor
+  
+  // Define desk pod regions per wing (based on actual desk coordinate analysis)
+  const deskPodRegions = userWing === 'W' ? [
+    // West wing: Main left corridor desk pods (pods 119, 121, 123, 125, 127)
+    // Desks at x: 8-53, y: 243-346
+    { x1: 5, y1: 240, x2: 70, y2: 360 },
+  ] : [
+    // East wing: Desks spread across x: 399-708, y: 11-374
+    // Main desk areas are in open floor space between rooms
+    { x1: 399, y1: 130, x2: 460, y2: 200 },  // Left corridor upper
+    { x1: 399, y1: 270, x2: 460, y2: 380 },  // Left corridor lower  
+    { x1: 490, y1: 130, x2: 625, y2: 380 },  // Center floor area
+    { x1: 655, y1: 130, x2: 720, y2: 380 },  // Right corridor
+  ];
+  
+  for (const region of deskPodRegions) {
+    const gx1 = Math.floor((region.x1 - xOffset) / SCALE);
+    const gy1 = Math.floor(region.y1 / SCALE);
+    const gx2 = Math.ceil((region.x2 - xOffset) / SCALE);
+    const gy2 = Math.ceil(region.y2 / SCALE);
+    
+    for (let y = Math.max(1, gy1); y < Math.min(HEIGHT - 1, gy2); y++) {
+      for (let x = Math.max(1, gx1); x < Math.min(WIDTH - 1, gx2); x++) {
+        // Only shade if this cell is empty and not part of any room
+        if (grid[y][x] === ' ' && !roomCells.has(`${y},${x}`)) {
+          grid[y][x] = '░';
+        }
+      }
+    }
+  }
+  
+  // Mark user's desk with a star and label (only if desk is on the displayed wing)
+  const deskWing = userDesk?.match(/\d{2}([EW])-/)?.[1];
+  const showDesk = userDeskCoords && userDesk && deskWing === userWing;
+  
+  if (showDesk) {
+    const deskX = Math.floor((userDeskCoords.cx - xOffset) / SCALE);
+    const deskY = Math.floor(userDeskCoords.cy / SCALE);
+    if (deskX > 0 && deskX < WIDTH - 1 && deskY > 0 && deskY < HEIGHT - 1) {
+      grid[deskY][deskX] = '★';
+      
+      // Add desk number label to the right of the star
+      // Extract just the desk number (e.g., "125-H" from "08W-125-H")
+      const deskNum = userDesk.replace(/^\d+[WE]-/, '');
+      const label = deskNum;
+      
+      // Place label to the right of the star if there's room
+      for (let i = 0; i < label.length && deskX + 2 + i < WIDTH - 1; i++) {
+        if (grid[deskY][deskX + 2 + i] === ' ' || grid[deskY][deskX + 2 + i] === '░') {
+          grid[deskY][deskX + 2 + i] = label[i];
+        }
+      }
+    }
+  }
+  
+  // Build output string with the preferred format
+  let output = '\n### 🗺️ Floor ' + baseFloor + wingFilter + ' - Accurate ASCII Map\n\n```\n';
+  output += `FLOOR ${baseFloor}${userWing} (${wingLabel.toLowerCase()} side)\n`;
+  output += '═'.repeat(WIDTH) + '\n';
+  
+  // Output grid (no axis labels)
+  for (let y = 0; y < HEIGHT; y++) {
+    output += grid[y].join('') + '\n';
+  }
+  
+  output += '═'.repeat(WIDTH) + '\n';
+  output += '```\n\n';
+  
+  // Legend
+  output += '**Legend:**\n';
+  output += '- `╔═══╗` Conference Room · `┌───┐` Huddle Space · `░░░` Desk Pods\n';
+  if (showDesk) {
+    output += `- \`★\` Your Desk (${userDeskShort})\n`;
+  }
+  output += '- `✓` Available · `✗` Busy\n\n';
+  
+  // Distance-sorted room list
+  if (userDeskCoords) {
+    output += `**Rooms by Distance from ${userDeskShort}:**\n`;
+    output += '| Room | Type | Status | ~Distance |\n';
+    output += '|------|------|--------|----------|\n';
+    
+    interface RoomDist { room: string; type: string; isAvail: boolean; dist: number }
+    const roomDists: RoomDist[] = [];
+    
+    for (const [roomNum, coords] of wingRooms) {
+      if (!allAvailable.has(roomNum) && !allUnavailable.has(roomNum)) continue;
+      
+      const dist = Math.sqrt(
+        Math.pow(coords.cx - userDeskCoords.cx, 2) + 
+        Math.pow(coords.cy - userDeskCoords.cy, 2)
+      );
+      
+      roomDists.push({
+        room: roomNum,
+        type: coords.type === 'conf' ? 'Conf' : 'Huddle',
+        isAvail: allAvailable.has(roomNum),
+        dist: Math.round(dist),
+      });
+    }
+    
+    roomDists.sort((a, b) => {
+      if (a.isAvail !== b.isAvail) return a.isAvail ? -1 : 1;
+      return a.dist - b.dist;
+    });
+    
+    for (const r of roomDists.slice(0, 12)) {
+      const status = r.isAvail ? '✅ Avail' : '❌ Busy';
+      const distFt = Math.round(r.dist * 0.4); // Rough pixel-to-feet conversion
+      output += `| ${r.room.padEnd(4)} | ${r.type.padEnd(6)} | ${status} | ~${distFt}ft |\n`;
+    }
+  }
+  
+  return output;
+}
+
+/**
+ * Simple fallback floor map for floors without coordinate data
+ */
+function generateSimpleFloorMap(options: {
+  availableConf: string[];
+  unavailableConf: string[];
+  availableHuddle: string[];
+  unavailableHuddle: string[];
+  userDesk: string | null;
+  wingFilter: string | null;
+  baseFloor: string;
+}): string {
+  const { availableConf, unavailableConf, availableHuddle, unavailableHuddle, userDesk, wingFilter, baseFloor } = options;
+  
+  const allRooms = [...availableConf, ...unavailableConf, ...availableHuddle, ...unavailableHuddle];
+  if (allRooms.length === 0) return '';
+  
+  interface RoomData {
+    name: string;
+    num: number;
+    wing: string;
+    isHuddle: boolean;
+    isAvailable: boolean;
+  }
+  
+  const roomsData: RoomData[] = allRooms.map(name => {
+    const wingMatch = name.match(/\d{2}([EW])/);
+    const numMatch = name.match(/\d{2}[EW]?-(\d+)/);
+    return {
+      name,
+      num: numMatch ? parseInt(numMatch[1], 10) : 0,
+      wing: wingMatch ? wingMatch[1] : '',
+      isHuddle: availableHuddle.includes(name) || unavailableHuddle.includes(name),
+      isAvailable: availableConf.includes(name) || availableHuddle.includes(name),
+    };
+  });
+  
+  const westRooms = roomsData.filter(r => r.wing === 'W').sort((a, b) => a.num - b.num);
+  const eastRooms = roomsData.filter(r => r.wing === 'E').sort((a, b) => a.num - b.num);
+  const userNumMatch = userDesk?.match(/\d{2}[EW]?-(\d+)/);
+  const userNum = userNumMatch ? parseInt(userNumMatch[1], 10) : 0;
+  const userWing = userDesk?.match(/\d{2}([EW])/)?.[1] || '';
+  
+  let output = '\n### 🗺️ Floor Map\n\n```\n';
+  
+  const formatRoom = (r: RoomData, highlight: boolean): string => {
+    const icon = r.isAvailable ? (r.isHuddle ? '🟢' : '🟩') : (r.isHuddle ? '🔴' : '🟥');
+    const num = String(r.num).padStart(3, ' ');
+    const marker = highlight ? '📍' : '  ';
+    return `${marker}${icon}${num}`;
+  };
+  
+  const showWest = !wingFilter || wingFilter === 'W';
+  const showEast = !wingFilter || wingFilter === 'E';
+  
+  output += `  ┌${'─'.repeat(50)}┐\n`;
+  output += `  │ Floor ${baseFloor}${wingFilter || ''} - Meeting Room Availability${' '.repeat(Math.max(0, 50 - 38 - (wingFilter ? 1 : 0)))}│\n`;
+  output += `  ├${'─'.repeat(50)}┤\n`;
+  output += `  │ 🟩 Conf (avail)  🟥 Conf (busy)  📍 Your desk   │\n`;
+  output += `  │ 🟢 Huddle (avail) 🔴 Huddle (busy)               │\n`;
+  output += `  ├${'─'.repeat(50)}┤\n`;
+  
+  const renderWing = (rooms: RoomData[], wingName: string): string => {
+    if (rooms.length === 0) return '';
+    let wingOutput = `  │ ${wingName} Wing:${' '.repeat(43 - wingName.length)}│\n`;
+    const rowSize = 5;
+    for (let i = 0; i < rooms.length; i += rowSize) {
+      const row = rooms.slice(i, i + rowSize);
+      const roomStrings = row.map(r => {
+        const isUserNearby = userWing === r.wing && Math.abs(userNum - r.num) < 10;
+        return formatRoom(r, isUserNearby && userDesk !== null);
+      });
+      const rowStr = roomStrings.join(' ');
+      wingOutput += `  │  ${rowStr}${' '.repeat(Math.max(0, 47 - rowStr.length))}│\n`;
+    }
+    return wingOutput;
+  };
+  
+  if (showWest && westRooms.length > 0) output += renderWing(westRooms, 'West');
+  if (showWest && showEast && westRooms.length > 0 && eastRooms.length > 0) output += `  ├${'─'.repeat(50)}┤\n`;
+  if (showEast && eastRooms.length > 0) output += renderWing(eastRooms, 'East');
+  
+  output += `  └${'─'.repeat(50)}┘\n`;
+  output += '```\n';
+  
+  return output;
+}
+
 /**
  * Sort rooms by proximity to a reference room number
  * e.g., if user is at 08W-125, prefer 08W-120, 08W-122 over 08W-464
@@ -1357,8 +1975,42 @@ async function handleCheckAvailability(args: {
           output += `\nWould you like me to book **${closestRoom}**? (yes/no/another)`;
         }
 
-        // Generate annotated map if map config is available (and not skipped)
-        if (!args.skipMap && roomConfig.mapConfig && roomConfig.mapConfig.floorMaps[baseFloor]) {
+        // Generate text-based floor map (default: true, skipped if skipMap is true)
+        if (!args.skipMap) {
+          // Try to fetch dynamic floor geo data for accurate map rendering
+          let floorGeoData: FloorGeoData | null = null;
+          if (roomConfig.mapConfig?.layerSettingId && roomConfig.floorIds?.[baseFloor]) {
+            try {
+              floorGeoData = await fetchFloorGeoData(
+                roomConfig.floorIds[baseFloor],
+                roomConfig.mapConfig.layerSettingId,
+                config.token,
+                config.host
+              );
+            } catch (e) {
+              // Fall back to static data if fetch fails
+            }
+          }
+          
+          const textMap = generateTextFloorMap({
+            availableConf: sortedAvailableConf,
+            unavailableConf: sortedUnavailableConf,
+            availableHuddle: sortedAvailableHuddle,
+            unavailableHuddle: sortedUnavailableHuddle,
+            userDesk,
+            wingFilter,
+            baseFloor,
+            floorGeoData,
+          });
+          if (textMap) {
+            output += '\n\n---\n**[AGENT: Display the ASCII floor map below EXACTLY as shown - do not modify, summarize, or add annotations to the map]**\n';
+            output += textMap;
+          }
+        }
+
+        // Image map generation disabled by default - keep the code for future use if needed
+        const showImageMap = false; // Can be re-enabled with a parameter if needed
+        if (showImageMap && roomConfig.mapConfig && roomConfig.mapConfig.floorMaps[baseFloor]) {
           try {
             // Get top recommendations for map (1 of each type, green markers)
             const topRecommendations = [
@@ -1386,7 +2038,7 @@ async function handleCheckAvailability(args: {
             });
 
             if (mapPath) {
-              output += `\n\n---\n📍 **Floor Map:** \`${mapPath}\``;
+              output += `\n\n---\n📍 **Floor Map Image:** \`${mapPath}\``;
             }
 
             // Cleanup old cached maps in background
