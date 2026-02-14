@@ -434,6 +434,56 @@ const TOOLS: Tool[] = [
       required: ['startTime'],
     },
   },
+  {
+    name: 'batch_check_availability',
+    description: 'Check meeting room availability across multiple days and times in a single call. Returns a summary table showing availability patterns. Useful for finding the best time slots across a week.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        floor: {
+          type: 'string',
+          description: 'Floor shortcut (e.g., "8", "8W", "8E"). If not provided, auto-detects from user\'s desk reservation.',
+        },
+        dates: {
+          type: 'array',
+          items: { type: 'string' },
+          description: 'Array of dates to check (YYYY-MM-DD format). Defaults to next 5 weekdays.',
+        },
+        times: {
+          type: 'array',
+          items: { type: 'string' },
+          description: 'Array of start times to check (HH:MM format, 24-hour). Defaults to hourly from 9am-5pm.',
+        },
+        duration: {
+          type: 'number',
+          description: 'Meeting duration in minutes. Defaults to 30.',
+        },
+      },
+      required: [],
+    },
+  },
+  {
+    name: 'get_availability_stats',
+    description: 'Generate visual text-based charts showing meeting room availability patterns for the week. Shows heatmaps, bar charts, and recommendations. Excludes Fridays by default since fewer people come in.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        floor: {
+          type: 'string',
+          description: 'Floor shortcut (e.g., "8", "8W", "8E"). If not provided, auto-detects from user\'s desk reservation.',
+        },
+        duration: {
+          type: 'number',
+          description: 'Meeting duration in minutes. Defaults to 30.',
+        },
+        includeFriday: {
+          type: 'boolean',
+          description: 'Include Friday in the stats. Defaults to false.',
+        },
+      },
+      required: [],
+    },
+  },
 ];
 
 // Tool handlers
@@ -1495,6 +1545,652 @@ async function handleCheckAvailability(args: {
   return output;
 }
 
+/**
+ * Batch check availability across multiple days and times
+ */
+async function handleBatchCheckAvailability(args: {
+  floor?: string;
+  dates?: string[];
+  times?: string[];
+  duration?: number;
+}): Promise<string> {
+  const duration = args.duration || 30;
+  
+  // Default times if not provided - cover business hours 9am-5:30pm
+  const times = args.times || ['09:00', '10:00', '11:00', '12:00', '13:00', '14:00', '15:00', '16:00', '17:00'];
+  
+  // Default to next 5 weekdays if dates not provided
+  // Use timezone-aware date calculation to avoid PST/EST issues
+  let dates = args.dates;
+  if (!dates || dates.length === 0) {
+    dates = [];
+    
+    // Get current date in the configured timezone (EST for the office)
+    const now = new Date();
+    const tzOffset = now.toLocaleString('en-US', { timeZone: config.timezone, hour: 'numeric', hour12: false });
+    
+    // Start from today in EST timezone
+    const estNow = new Date(now.toLocaleString('en-US', { timeZone: config.timezone }));
+    let currentDate = new Date(estNow);
+    let daysAdded = 0;
+    
+    while (daysAdded < 5) {
+      currentDate.setDate(currentDate.getDate() + 1);
+      const dayOfWeek = currentDate.getDay();
+      if (dayOfWeek !== 0 && dayOfWeek !== 6) { // Skip weekends
+        // Format date as YYYY-MM-DD without timezone conversion
+        const year = currentDate.getFullYear();
+        const month = String(currentDate.getMonth() + 1).padStart(2, '0');
+        const day = String(currentDate.getDate()).padStart(2, '0');
+        dates.push(`${year}-${month}-${day}`);
+        daysAdded++;
+      }
+    }
+  }
+  
+  // Determine floor from user's desk if not provided
+  let floor = args.floor;
+  let userDesk: string | null = null;
+  
+  if (!floor) {
+    const deskInfo = await getUserFloorForDate(dates[0]);
+    if (deskInfo) {
+      floor = deskInfo.floor;
+      userDesk = deskInfo.deskName;
+    }
+  }
+  
+  if (!floor) {
+    return 'Could not determine floor. Please provide a floor parameter or ensure you have a desk reservation.';
+  }
+  
+  const floorPattern = resolveFloorPattern(floor, roomConfig);
+  const baseFloor = floorPattern.replace(/[EW]$/, '');
+  const wingFilter = floorPattern.match(/[EW]$/)?.[0] || null;
+  
+  // Check if we have floor IDs configured
+  if (!roomConfig.floorIds || !roomConfig.building.networkId) {
+    return 'Floor IDs not configured. Batch availability check requires the new API.';
+  }
+  
+  const matchingFloorIds: string[] = [];
+  for (const [key, floorId] of Object.entries(roomConfig.floorIds)) {
+    if (key === '_comment') continue;
+    if (key === floorPattern || key === baseFloor || key.startsWith(floorPattern)) {
+      matchingFloorIds.push(floorId as string);
+    }
+  }
+  
+  if (matchingFloorIds.length === 0) {
+    return `No floor IDs found for floor ${floor}`;
+  }
+  
+  // Collect availability data
+  interface SlotData {
+    date: string;
+    time: string;
+    confAvailable: number;
+    huddleAvailable: number;
+    totalAvailable: number;
+    unavailable: number;
+  }
+  
+  const results: SlotData[] = [];
+  
+  for (const date of dates) {
+    for (const time of times) {
+      const endTime = calculateEndTime(time, duration);
+      const { startAt, endAt } = getFullDayRange(date, time, endTime, config.timezone);
+      
+      const result = await client.getReservableResources({
+        floorIds: matchingFloorIds,
+        locationId: roomConfig.building.networkId,
+        startAt,
+        endAt,
+        types: ['room', 'space'],
+      });
+      
+      let confAvailable = 0;
+      let huddleAvailable = 0;
+      let unavailable = 0;
+      
+      if (result.success && result.data?.items) {
+        for (const room of result.data.items) {
+          const shortName = room.name.replace('!CR NYNY 7 HUDSON ', '').replace('!CR ', '');
+          
+          if (isExcludedResource(shortName) || isDesk(shortName)) continue;
+          
+          const roomWing = shortName.match(/^\d{2}([EW])/)?.[1];
+          if (wingFilter && roomWing !== wingFilter) continue;
+          
+          const isHuddle = room.subType?.toLowerCase().includes('huddle') || 
+                          room.type?.toLowerCase() === 'space';
+          const isAvailable = room.reservableStatus.toLowerCase() === 'available';
+          
+          if (isAvailable) {
+            if (isHuddle) huddleAvailable++;
+            else confAvailable++;
+          } else {
+            unavailable++;
+          }
+        }
+      }
+      
+      results.push({
+        date,
+        time,
+        confAvailable,
+        huddleAvailable,
+        totalAvailable: confAvailable + huddleAvailable,
+        unavailable,
+      });
+    }
+  }
+  
+  // Build output table
+  let output = `## 📊 Weekly Availability Summary (Floor ${baseFloor}${wingFilter || ''})\n\n`;
+  
+  if (userDesk) {
+    output += `📍 Your desk: **${userDesk}**\n\n`;
+  }
+  
+  output += `| Day | Time | Conf | Huddle | **Total** | Busy |\n`;
+  output += `|-----|------|------|--------|-----------|------|\n`;
+  
+  // Group by date for better display
+  const dateGroups = new Map<string, SlotData[]>();
+  for (const r of results) {
+    if (!dateGroups.has(r.date)) dateGroups.set(r.date, []);
+    dateGroups.get(r.date)!.push(r);
+  }
+  
+  let bestSlot: SlotData | null = null;
+  let worstSlot: SlotData | null = null;
+  
+  for (const [date, slots] of dateGroups) {
+    const [year, month, day] = date.split('-').map(Number);
+    const dateObj = new Date(year, month - 1, day);
+    const dayName = dateObj.toLocaleDateString('en-US', { weekday: 'short' });
+    const dateLabel = `${dayName} ${month}/${day}`;
+    
+    for (let i = 0; i < slots.length; i++) {
+      const s = slots[i];
+      const availIcon = s.totalAvailable >= 15 ? '✅' : s.totalAvailable >= 10 ? '🟡' : '⚠️';
+      
+      // Track best/worst
+      if (!bestSlot || s.totalAvailable > bestSlot.totalAvailable) bestSlot = s;
+      if (!worstSlot || s.totalAvailable < worstSlot.totalAvailable) worstSlot = s;
+      
+      if (i === 0) {
+        output += `| **${dateLabel}** | ${s.time} | ${s.confAvailable} | ${s.huddleAvailable} | ${availIcon} **${s.totalAvailable}** | ${s.unavailable} |\n`;
+      } else {
+        output += `| | ${s.time} | ${s.confAvailable} | ${s.huddleAvailable} | ${availIcon} **${s.totalAvailable}** | ${s.unavailable} |\n`;
+      }
+    }
+  }
+  
+  // Add insights
+  output += `\n---\n\n`;
+  output += `### 🔑 Key Insights\n\n`;
+  
+  if (bestSlot) {
+    const [y, m, d] = bestSlot.date.split('-').map(Number);
+    const bestDay = new Date(y, m - 1, d).toLocaleDateString('en-US', { weekday: 'long' });
+    output += `**🟢 Most available:** ${bestDay} at ${bestSlot.time} (${bestSlot.totalAvailable} rooms)\n`;
+  }
+  
+  if (worstSlot) {
+    const [y, m, d] = worstSlot.date.split('-').map(Number);
+    const worstDay = new Date(y, m - 1, d).toLocaleDateString('en-US', { weekday: 'long' });
+    output += `**🔴 Busiest slot:** ${worstDay} at ${worstSlot.time} (only ${worstSlot.totalAvailable} rooms)\n`;
+  }
+  
+  // Calculate averages by time
+  const timeAverages = new Map<string, number[]>();
+  for (const r of results) {
+    if (!timeAverages.has(r.time)) timeAverages.set(r.time, []);
+    timeAverages.get(r.time)!.push(r.totalAvailable);
+  }
+  
+  output += `\n**Average by time:**\n`;
+  for (const [time, values] of timeAverages) {
+    const avg = Math.round(values.reduce((a, b) => a + b, 0) / values.length);
+    output += `  • ${time}: ~${avg} rooms available\n`;
+  }
+  
+  return output;
+}
+
+/**
+ * Generate visual availability stats with text-based charts
+ */
+async function handleGetAvailabilityStats(args: {
+  floor?: string;
+  duration?: number;
+  includeFriday?: boolean;
+}): Promise<string> {
+  const duration = args.duration || 30;
+  const includeFriday = args.includeFriday || false;
+  
+  // Generate dates for Mon-Thu (or Mon-Fri if includeFriday)
+  const dates: string[] = [];
+  const now = new Date();
+  const estNow = new Date(now.toLocaleString('en-US', { timeZone: config.timezone }));
+  let currentDate = new Date(estNow);
+  let daysAdded = 0;
+  const maxDays = includeFriday ? 5 : 4;
+  
+  while (daysAdded < maxDays) {
+    currentDate.setDate(currentDate.getDate() + 1);
+    const dayOfWeek = currentDate.getDay();
+    // Skip weekends, and skip Friday (5) unless includeFriday is true
+    if (dayOfWeek === 0 || dayOfWeek === 6) continue;
+    if (dayOfWeek === 5 && !includeFriday) continue;
+    
+    const year = currentDate.getFullYear();
+    const month = String(currentDate.getMonth() + 1).padStart(2, '0');
+    const day = String(currentDate.getDate()).padStart(2, '0');
+    dates.push(`${year}-${month}-${day}`);
+    daysAdded++;
+  }
+  
+  const times = ['09:00', '10:00', '11:00', '12:00', '13:00', '14:00', '15:00', '16:00', '17:00'];
+  
+  // Determine floor
+  let floor = args.floor;
+  let userDesk: string | null = null;
+  
+  if (!floor) {
+    const deskInfo = await getUserFloorForDate(dates[0]);
+    if (deskInfo) {
+      floor = deskInfo.floor;
+      userDesk = deskInfo.deskName;
+    }
+  }
+  
+  if (!floor) {
+    return 'Could not determine floor. Please provide a floor parameter or ensure you have a desk reservation.';
+  }
+  
+  const floorPattern = resolveFloorPattern(floor, roomConfig);
+  const baseFloor = floorPattern.replace(/[EW]$/, '');
+  const wingFilter = floorPattern.match(/[EW]$/)?.[0] || null;
+  
+  if (!roomConfig.floorIds || !roomConfig.building.networkId) {
+    return 'Floor IDs not configured. Stats generation requires the new API.';
+  }
+  
+  const matchingFloorIds: string[] = [];
+  for (const [key, floorId] of Object.entries(roomConfig.floorIds)) {
+    if (key === '_comment') continue;
+    if (key === floorPattern || key === baseFloor || key.startsWith(floorPattern)) {
+      matchingFloorIds.push(floorId as string);
+    }
+  }
+  
+  if (matchingFloorIds.length === 0) {
+    return `No floor IDs found for floor ${floor}`;
+  }
+  
+  // Collect availability data
+  interface SlotData {
+    date: string;
+    dayName: string;
+    time: string;
+    confAvailable: number;
+    huddleAvailable: number;
+    totalAvailable: number;
+    unavailable: number;
+  }
+  
+  // Track per-room availability
+  interface RoomStats {
+    name: string;
+    isHuddle: boolean;
+    availableSlots: number;
+    totalSlots: number;
+    availableByTime: Map<string, number>; // time -> count of days available
+    availableByDay: Map<string, number>;  // dayName -> count of times available
+  }
+  
+  const roomStatsMap = new Map<string, RoomStats>();
+  const results: SlotData[] = [];
+  const totalSlots = dates.length * times.length;
+  
+  for (const date of dates) {
+    const [year, month, day] = date.split('-').map(Number);
+    const dateObj = new Date(year, month - 1, day);
+    const dayName = dateObj.toLocaleDateString('en-US', { weekday: 'short' });
+    
+    for (const time of times) {
+      const endTime = calculateEndTime(time, duration);
+      const { startAt, endAt } = getFullDayRange(date, time, endTime, config.timezone);
+      
+      const result = await client.getReservableResources({
+        floorIds: matchingFloorIds,
+        locationId: roomConfig.building.networkId,
+        startAt,
+        endAt,
+        types: ['room', 'space'],
+      });
+      
+      let confAvailable = 0;
+      let huddleAvailable = 0;
+      let unavailable = 0;
+      
+      if (result.success && result.data?.items) {
+        for (const room of result.data.items) {
+          const shortName = room.name.replace('!CR NYNY 7 HUDSON ', '').replace('!CR ', '');
+          
+          if (isExcludedResource(shortName) || isDesk(shortName)) continue;
+          
+          const roomWing = shortName.match(/^\d{2}([EW])/)?.[1];
+          if (wingFilter && roomWing !== wingFilter) continue;
+          
+          const isHuddle = room.subType?.toLowerCase().includes('huddle') || 
+                          room.type?.toLowerCase() === 'space';
+          const isAvailable = room.reservableStatus.toLowerCase() === 'available';
+          
+          // Track per-room stats
+          if (!roomStatsMap.has(shortName)) {
+            roomStatsMap.set(shortName, {
+              name: shortName,
+              isHuddle,
+              availableSlots: 0,
+              totalSlots: 0,
+              availableByTime: new Map(),
+              availableByDay: new Map(),
+            });
+          }
+          const roomStats = roomStatsMap.get(shortName)!;
+          roomStats.totalSlots++;
+          
+          if (isAvailable) {
+            roomStats.availableSlots++;
+            roomStats.availableByTime.set(time, (roomStats.availableByTime.get(time) || 0) + 1);
+            roomStats.availableByDay.set(dayName, (roomStats.availableByDay.get(dayName) || 0) + 1);
+            
+            if (isHuddle) huddleAvailable++;
+            else confAvailable++;
+          } else {
+            unavailable++;
+          }
+        }
+      }
+      
+      results.push({
+        date,
+        dayName,
+        time,
+        confAvailable,
+        huddleAvailable,
+        totalAvailable: confAvailable + huddleAvailable,
+        unavailable,
+      });
+    }
+  }
+  
+  // Convert room stats to sorted arrays
+  const allRoomStats = Array.from(roomStatsMap.values());
+  const confRooms = allRoomStats.filter(r => !r.isHuddle).sort((a, b) => 
+    (b.availableSlots / b.totalSlots) - (a.availableSlots / a.totalSlots)
+  );
+  const huddleRooms = allRoomStats.filter(r => r.isHuddle).sort((a, b) => 
+    (b.availableSlots / b.totalSlots) - (a.availableSlots / a.totalSlots)
+  );
+  
+  // Calculate averages by time
+  const timeAverages = new Map<string, number>();
+  for (const time of times) {
+    const slots = results.filter(r => r.time === time);
+    const avg = Math.round(slots.reduce((a, b) => a + b.totalAvailable, 0) / slots.length);
+    timeAverages.set(time, avg);
+  }
+  
+  // Calculate averages by day
+  const dayAverages = new Map<string, { dayName: string; avg: number }>();
+  for (const date of dates) {
+    const slots = results.filter(r => r.date === date);
+    const avg = Math.round(slots.reduce((a, b) => a + b.totalAvailable, 0) / slots.length);
+    dayAverages.set(date, { dayName: slots[0].dayName, avg });
+  }
+  
+  // Find best and worst slots
+  let bestSlot = results[0];
+  let worstSlot = results[0];
+  for (const r of results) {
+    if (r.totalAvailable > bestSlot.totalAvailable) bestSlot = r;
+    if (r.totalAvailable < worstSlot.totalAvailable) worstSlot = r;
+  }
+  
+  // Build output with charts
+  let output = `## 📊 Meeting Room Availability Stats (Floor ${baseFloor}${wingFilter || ''})\n\n`;
+  
+  if (userDesk) {
+    output += `📍 Your desk: **${userDesk}**\n`;
+  }
+  output += `📅 ${includeFriday ? 'Mon-Fri' : 'Mon-Thu'} | ⏱️ ${duration} min meetings\n\n`;
+  
+  // Bar chart by time
+  output += `### 📊 Average Availability by Time\n\n`;
+  output += '```\n';
+  output += '        ┌─────────────────────────────────────────┐\n';
+  
+  for (const time of times) {
+    const avg = timeAverages.get(time) || 0;
+    const barLength = Math.round(avg * 2); // Scale for display
+    const bar = '█'.repeat(barLength);
+    const timeLabel = time.replace(':00', '').padStart(5, ' ');
+    const suffix = avg >= 18 ? '  ✅ Best' : avg <= 12 ? '  ⚠️ Busy' : '';
+    
+    // Convert 24h to 12h format for display
+    const hour = parseInt(time.split(':')[0]);
+    const displayTime = hour <= 12 ? `${hour}am` : `${hour - 12}pm`;
+    const paddedTime = displayTime.padStart(5, ' ');
+    
+    output += `${paddedTime}  │${bar.padEnd(40, ' ')}│ ${avg}${suffix}\n`;
+  }
+  
+  output += '        └─────────────────────────────────────────┘\n';
+  output += '              5    10    15    20 rooms\n';
+  output += '```\n\n';
+  
+  // Heatmap
+  output += `### 🗓️ Availability Heatmap\n\n`;
+  output += '```\n';
+  
+  // Header row
+  const dayHeaders = dates.map(d => {
+    const [y, m, day] = d.split('-').map(Number);
+    return new Date(y, m - 1, day).toLocaleDateString('en-US', { weekday: 'short' });
+  });
+  output += '        ' + dayHeaders.map(d => d.padStart(5, ' ')).join('  ') + '\n';
+  output += '        ┌' + dayHeaders.map(() => '─────').join('┬') + '┐\n';
+  
+  for (const time of times) {
+    const hour = parseInt(time.split(':')[0]);
+    const displayTime = hour <= 12 ? `${hour}am` : `${hour - 12}pm`;
+    const paddedTime = displayTime.padStart(5, ' ');
+    
+    let row = `${paddedTime}   │`;
+    for (const date of dates) {
+      const slot = results.find(r => r.date === date && r.time === time);
+      const total = slot?.totalAvailable || 0;
+      const icon = total >= 15 ? '🟢' : total >= 10 ? '🟡' : '🔴';
+      row += ` ${icon}${String(total).padStart(2, ' ')} │`;
+    }
+    output += row + '\n';
+  }
+  
+  output += '        └' + dayHeaders.map(() => '─────').join('┴') + '┘\n';
+  output += '         🟢 15+   🟡 10-14   🔴 <10 rooms\n';
+  output += '```\n\n';
+  
+  // Daily comparison
+  output += `### 📈 Daily Comparison\n\n`;
+  output += '```\n';
+  
+  const maxAvg = Math.max(...Array.from(dayAverages.values()).map(d => d.avg));
+  for (const [date, data] of dayAverages) {
+    const barLength = Math.round((data.avg / maxAvg) * 20);
+    const bar = '█'.repeat(barLength);
+    const suffix = data.avg === maxAvg ? '  ✅ BEST' : '';
+    output += `        ${data.dayName} ${bar.padEnd(20, ' ')} avg ${data.avg} rooms${suffix}\n`;
+  }
+  
+  output += '            └────┴────┴────┴────┘\n';
+  output += '            5   10   15   20\n';
+  output += '```\n\n';
+  
+  // Recommendations
+  output += `### 🎯 Recommendations\n\n`;
+  output += '```\n';
+  output += '┌─────────────────────────────────────────────────────┐\n';
+  output += '│  🟢 BEST TIMES           │  🔴 AVOID               │\n';
+  output += '│  ────────────────        │  ──────────────         │\n';
+  
+  // Find best day
+  let bestDay = '';
+  let bestDayAvg = 0;
+  for (const [date, data] of dayAverages) {
+    if (data.avg > bestDayAvg) {
+      bestDayAvg = data.avg;
+      bestDay = data.dayName;
+    }
+  }
+  
+  // Find best/worst times
+  const sortedTimes = Array.from(timeAverages.entries()).sort((a, b) => b[1] - a[1]);
+  const bestTimes = sortedTimes.slice(0, 2);
+  const worstTimes = sortedTimes.slice(-2).reverse();
+  
+  const [y1, m1, d1] = worstSlot.date.split('-').map(Number);
+  const worstDayName = new Date(y1, m1 - 1, d1).toLocaleDateString('en-US', { weekday: 'short' });
+  const worstTimeDisplay = worstSlot.time.replace(':00', '');
+  const worstHour = parseInt(worstTimeDisplay);
+  const worstTimeFormatted = worstHour <= 12 ? `${worstHour}am` : `${worstHour - 12}pm`;
+  
+  output += `│  ✅ ${bestDay} (all day!)     │  ❌ ${worstDayName} ${worstTimeFormatted} (${worstSlot.totalAvailable} rooms)    │\n`;
+  
+  const bestTime1 = bestTimes[0][0].replace(':00', '');
+  const bestHour1 = parseInt(bestTime1);
+  const bestTimeFormatted1 = bestHour1 <= 12 ? `${bestHour1}am` : `${bestHour1 - 12}pm`;
+  
+  const bestTime2 = bestTimes[1][0].replace(':00', '');
+  const bestHour2 = parseInt(bestTime2);
+  const bestTimeFormatted2 = bestHour2 <= 12 ? `${bestHour2}am` : `${bestHour2 - 12}pm`;
+  
+  output += `│  ✅ ${bestTimeFormatted1} any day         │  ⚠️ Midday Tue-Thu        │\n`;
+  output += `│  ✅ ${bestTimeFormatted2} any day         │                           │\n`;
+  output += '└─────────────────────────────────────────────────────┘\n';
+  output += '```\n\n';
+  
+  // Room availability charts
+  output += `### 🏢 Conference Room Availability\n\n`;
+  output += '```\n';
+  output += 'Room        Avail%  ';
+  for (const dayName of ['Mon', 'Tue', 'Wed', 'Thu']) {
+    output += dayName.padStart(4, ' ') + ' ';
+  }
+  output += '\n';
+  output += '─'.repeat(50) + '\n';
+  
+  for (const room of confRooms) {
+    const pct = Math.round((room.availableSlots / room.totalSlots) * 100);
+    const barLen = Math.round(pct / 10);
+    const bar = '█'.repeat(barLen) + '░'.repeat(10 - barLen);
+    const roomName = room.name.replace(/^\d{2}[EW]-/, '').padEnd(8, ' ');
+    
+    let dayIndicators = '';
+    for (const dayName of ['Mon', 'Tue', 'Wed', 'Thu']) {
+      const dayAvail = room.availableByDay.get(dayName) || 0;
+      const dayPct = Math.round((dayAvail / times.length) * 100);
+      const indicator = dayPct >= 80 ? ' ✓✓ ' : dayPct >= 50 ? ' ✓  ' : dayPct > 0 ? ' ·  ' : ' ✗  ';
+      dayIndicators += indicator;
+    }
+    
+    output += `${room.name.padEnd(10, ' ')} ${bar} ${String(pct).padStart(3, ' ')}% ${dayIndicators}\n`;
+  }
+  output += '\n✓✓ = 80%+  ✓ = 50%+  · = <50%  ✗ = 0%\n';
+  output += '```\n\n';
+  
+  // Huddle room availability
+  output += `### 🪑 Huddle Space Availability\n\n`;
+  output += '```\n';
+  output += 'Room        Avail%  ';
+  for (const dayName of ['Mon', 'Tue', 'Wed', 'Thu']) {
+    output += dayName.padStart(4, ' ') + ' ';
+  }
+  output += '\n';
+  output += '─'.repeat(50) + '\n';
+  
+  // Show top 10 huddles to keep output manageable
+  const topHuddles = huddleRooms.slice(0, 10);
+  for (const room of topHuddles) {
+    const pct = Math.round((room.availableSlots / room.totalSlots) * 100);
+    const barLen = Math.round(pct / 10);
+    const bar = '█'.repeat(barLen) + '░'.repeat(10 - barLen);
+    
+    let dayIndicators = '';
+    for (const dayName of ['Mon', 'Tue', 'Wed', 'Thu']) {
+      const dayAvail = room.availableByDay.get(dayName) || 0;
+      const dayPct = Math.round((dayAvail / times.length) * 100);
+      const indicator = dayPct >= 80 ? ' ✓✓ ' : dayPct >= 50 ? ' ✓  ' : dayPct > 0 ? ' ·  ' : ' ✗  ';
+      dayIndicators += indicator;
+    }
+    
+    output += `${room.name.padEnd(10, ' ')} ${bar} ${String(pct).padStart(3, ' ')}% ${dayIndicators}\n`;
+  }
+  
+  if (huddleRooms.length > 10) {
+    output += `... and ${huddleRooms.length - 10} more huddle spaces\n`;
+  }
+  output += '```\n\n';
+  
+  // Best rooms by time of day
+  output += `### ⏰ Best Rooms by Time of Day\n\n`;
+  output += '```\n';
+  
+  const morningTimes = ['09:00', '10:00', '11:00'];
+  const middayTimes = ['12:00', '13:00', '14:00'];
+  const afternoonTimes = ['15:00', '16:00', '17:00'];
+  
+  const getRoomsByTimeRange = (timesRange: string[]) => {
+    const roomScores = new Map<string, number>();
+    for (const room of allRoomStats) {
+      let score = 0;
+      for (const t of timesRange) {
+        score += room.availableByTime.get(t) || 0;
+      }
+      roomScores.set(room.name, score);
+    }
+    return Array.from(roomScores.entries())
+      .sort((a, b) => b[1] - a[1])
+      .slice(0, 3)
+      .map(([name]) => name);
+  };
+  
+  const morningBest = getRoomsByTimeRange(morningTimes);
+  const middayBest = getRoomsByTimeRange(middayTimes);
+  const afternoonBest = getRoomsByTimeRange(afternoonTimes);
+  
+  output += '┌──────────────┬────────────────────────────────────┐\n';
+  output += '│  TIME        │  MOST AVAILABLE ROOMS              │\n';
+  output += '├──────────────┼────────────────────────────────────┤\n';
+  output += `│  🌅 Morning  │  ${morningBest.join(', ').padEnd(34, ' ')}│\n`;
+  output += `│  (9-11am)    │                                    │\n`;
+  output += '├──────────────┼────────────────────────────────────┤\n';
+  output += `│  ☀️ Midday   │  ${middayBest.join(', ').padEnd(34, ' ')}│\n`;
+  output += `│  (12-2pm)    │                                    │\n`;
+  output += '├──────────────┼────────────────────────────────────┤\n';
+  output += `│  🌆 Afternoon│  ${afternoonBest.join(', ').padEnd(34, ' ')}│\n`;
+  output += `│  (3-5pm)     │                                    │\n`;
+  output += '└──────────────┴────────────────────────────────────┘\n';
+  output += '```\n';
+  
+  return output;
+}
+
 // Main server setup
 async function main(): Promise<void> {
   validateConfig();
@@ -1576,6 +2272,12 @@ async function main(): Promise<void> {
           break;
         case 'check_meeting_availability':
           result = await handleCheckAvailability(args as Parameters<typeof handleCheckAvailability>[0]);
+          break;
+        case 'batch_check_availability':
+          result = await handleBatchCheckAvailability(args as Parameters<typeof handleBatchCheckAvailability>[0]);
+          break;
+        case 'get_availability_stats':
+          result = await handleGetAvailabilityStats(args as Parameters<typeof handleGetAvailabilityStats>[0]);
           break;
         default:
           result = `Unknown tool: ${name}`;
