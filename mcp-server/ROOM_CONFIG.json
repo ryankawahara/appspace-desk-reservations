@@ -80,6 +80,20 @@
     "17W": "06ba2c77-e353-4728-80c8-1095865526d8",
     "C1": "aeb85e12-6769-4f51-85c8-15694c203ed1",
     "C2": "75b81a19-17c5-4661-ab01-4f05d2428f78"
+  },
+  "mapConfig": {
+    "_comment": "Floor map configuration for generating annotated maps",
+    "cdnBase": "https://000000000000000000000000000000001bc883df9d64x76c2prd-st1.appspaceusercontent.com/content",
+    "contentId": "5ffe8db1-3b04-4c25-8659-aac981889242",
+    "layerSettingId": "f39c0b0d-9143-4990-942d-cda356b28059",
+    "floorMaps": {
+      "08": {
+        "floorPlanContentId": "4839273a-35e0-4941-a45b-2cb7c51c3d9a",
+        "svgPath": "o/1760382795/fl_8_1_1.svg",
+        "width": 721,
+        "height": 385
+      }
+    }
   }
 }
 

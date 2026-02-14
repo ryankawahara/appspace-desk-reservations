@@ -16,6 +16,7 @@ import {
 } from '@modelcontextprotocol/sdk/types.js';
 import { AppspaceClient, getFullDayRange } from './appspace-client.js';
 import { loadDeskLookup, resolveResourceId } from './desk-lookup.js';
+import { generateAnnotatedMap, cleanupOldMaps } from './map-generator.js';
 import { readFile } from 'fs/promises';
 import { dirname, join } from 'path';
 import { fileURLToPath } from 'url';
@@ -34,6 +35,17 @@ interface RoomConfig {
   }>;
   shortcuts: Record<string, string>;
   floorIds?: Record<string, string>;
+  mapConfig?: {
+    cdnBase: string;
+    contentId: string;
+    layerSettingId: string;
+    floorMaps: Record<string, {
+      floorPlanContentId: string;
+      svgPath: string;
+      width: number;
+      height: number;
+    }>;
+  };
 }
 
 // Load room configuration
@@ -84,6 +96,30 @@ const config = {
   defaultEndTime: process.env.BOOKING_END_TIME || '17:00',
   deskLookupPath: process.env.DESK_LOOKUP_PATH || './DESK_LOOKUP.json',
 };
+
+// Resources that have been converted to offices and should be excluded from availability
+// These still appear in Appspace but are no longer bookable spaces
+const EXCLUDED_RESOURCES = new Set([
+  '08W-118',
+  '08W-120',
+  '08W-122',
+]);
+
+// Helper to check if a resource should be excluded
+function isExcludedResource(shortName: string): boolean {
+  return EXCLUDED_RESOURCES.has(shortName);
+}
+
+/**
+ * Check if a resource name is a desk (has a letter suffix like -A, -B, -H)
+ * Desks: 08W-125-A, 08W-125-H (format: XXY-NNN-L where L is a letter)
+ * Meeting rooms: 08W-460, 08W-134 (format: XXY-NNN with no letter suffix)
+ */
+function isDesk(resourceName: string): boolean {
+  // Desks have a letter suffix: 08W-125-A, 08W-127-B, etc.
+  // Meeting rooms don't: 08W-460, 08W-134
+  return /\d{2}[EW]-\d+-[A-Z]$/i.test(resourceName);
+}
 
 // Validate required configuration
 function validateConfig(): void {
@@ -356,8 +392,8 @@ const TOOLS: Tool[] = [
     },
   },
   {
-    name: 'check_availability',
-    description: 'Check availability of conference rooms for a meeting. If no floor is specified, automatically detects the floor from the user\'s desk reservation for that day. Accepts either duration (in minutes) or end time.',
+    name: 'check_meeting_availability',
+    description: 'Check availability of conference rooms and huddle rooms for a meeting. Excludes desks from results. If no floor is specified, automatically detects the floor from the user\'s desk reservation for that day. Accepts either duration (in minutes) or end time.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -970,17 +1006,30 @@ async function getUserFloorForDate(targetDate: string): Promise<{ floor: string;
 function sortByProximity(rooms: string[], referenceDesk: string | null): string[] {
   if (!referenceDesk) return rooms.sort();
   
-  // Extract the room number from the reference desk (e.g., "08W-125-H" -> 125)
-  const refMatch = referenceDesk.match(/\d{2}[EW]?-(\d+)/);
-  const refNumber = refMatch ? parseInt(refMatch[1], 10) : 0;
+  // Extract wing and room number from reference desk (e.g., "08W-125-H" -> W, 125)
+  const refWingMatch = referenceDesk.match(/\d{2}([EW])/);
+  const refWing = refWingMatch ? refWingMatch[1] : null;
+  const refNumMatch = referenceDesk.match(/\d{2}[EW]?-(\d+)/);
+  const refNumber = refNumMatch ? parseInt(refNumMatch[1], 10) : 0;
   
   return rooms.sort((a, b) => {
-    const aMatch = a.match(/\d{2}[EW]?-(\d+)/);
-    const bMatch = b.match(/\d{2}[EW]?-(\d+)/);
-    const aNum = aMatch ? parseInt(aMatch[1], 10) : 0;
-    const bNum = bMatch ? parseInt(bMatch[1], 10) : 0;
+    // Extract wing and number for each room
+    const aWingMatch = a.match(/\d{2}([EW])/);
+    const bWingMatch = b.match(/\d{2}([EW])/);
+    const aWing = aWingMatch ? aWingMatch[1] : null;
+    const bWing = bWingMatch ? bWingMatch[1] : null;
     
-    // Sort by distance from reference number
+    const aNumMatch = a.match(/\d{2}[EW]?-(\d+)/);
+    const bNumMatch = b.match(/\d{2}[EW]?-(\d+)/);
+    const aNum = aNumMatch ? parseInt(aNumMatch[1], 10) : 0;
+    const bNum = bNumMatch ? parseInt(bNumMatch[1], 10) : 0;
+    
+    // Prioritize same wing as user's desk
+    const aSameWing = aWing === refWing ? 0 : 1;
+    const bSameWing = bWing === refWing ? 0 : 1;
+    if (aSameWing !== bSameWing) return aSameWing - bSameWing;
+    
+    // Then sort by distance from reference room number
     return Math.abs(aNum - refNumber) - Math.abs(bNum - refNumber);
   });
 }
@@ -1006,16 +1055,18 @@ async function handleCheckAvailability(args: {
     endTime = calculateEndTime(args.startTime, 60);
   }
   
-  // Auto-detect floor from desk reservation if not provided
+  // Look up user's desk reservation for this date (for proximity sorting)
   let floor = args.floor;
   let userDesk: string | null = null;
   let autoDetectedFloor = false;
   
-  if (!floor && !args.resources && !args.location) {
-    const deskInfo = await getUserFloorForDate(date);
-    if (deskInfo) {
+  // Always try to get user's desk for proximity-based recommendations
+  const deskInfo = await getUserFloorForDate(date);
+  if (deskInfo) {
+    userDesk = deskInfo.deskName;
+    // Only auto-detect floor if not explicitly provided
+    if (!floor && !args.resources && !args.location) {
       floor = deskInfo.floor;
-      userDesk = deskInfo.deskName;
       autoDetectedFloor = true;
     }
   }
@@ -1045,18 +1096,23 @@ async function handleCheckAvailability(args: {
 
     if (matchingFloorIds.length > 0) {
       // Use the correct Appspace API
+      // Include both conference rooms ('room') and huddle spaces ('space')
       const result = await client.getReservableResources({
         floorIds: matchingFloorIds,
         locationId: roomConfig.building.networkId,
         startAt,
         endAt,
-        types: ['room'],
+        types: ['room', 'space'],
       });
 
       if (result.success && result.data?.items) {
-        const available: string[] = [];
-        const unavailable: string[] = [];
-        const otherWingAvailable: string[] = [];
+        // Separate conference rooms and huddle spaces
+        const availableConf: string[] = [];
+        const availableHuddle: string[] = [];
+        const unavailableConf: string[] = [];
+        const unavailableHuddle: string[] = [];
+        const otherWingConf: string[] = [];
+        const otherWingHuddle: string[] = [];
 
         // Determine the opposite wing for recommendations
         const oppositeWing = wingFilter === 'W' ? 'E' : wingFilter === 'E' ? 'W' : null;
@@ -1064,77 +1120,225 @@ async function handleCheckAvailability(args: {
         for (const room of result.data.items) {
           // Extract just the room number for cleaner display
           const shortName = room.name.replace('!CR NYNY 7 HUDSON ', '').replace('!CR ', '');
+          
+          // Skip resources that have been converted to offices
+          if (isExcludedResource(shortName)) {
+            continue;
+          }
+          
+          // Skip desks - they have a letter suffix like 08W-125-A, 08W-127-B
+          // Meeting rooms don't have letter suffixes: 08W-460, 08W-134
+          if (isDesk(shortName)) {
+            continue;
+          }
+          
           const roomWing = shortName.match(/^\d{2}([EW])/)?.[1];
+          
+          // Determine if this is a huddle space based on subType
+          // Note: Since we've filtered out desks above, remaining 'space' types are huddle rooms
+          const isHuddle = room.subType?.toLowerCase().includes('huddle') || 
+                          room.type?.toLowerCase() === 'space';
+          const isAvailable = room.reservableStatus.toLowerCase() === 'available';
           
           // Filter by wing if a specific wing was requested (e.g., "8W" should only show 08W rooms)
           if (wingFilter && roomWing !== wingFilter) {
             // Track available rooms on the opposite wing for recommendations
-            if (roomWing === oppositeWing && room.reservableStatus.toLowerCase() === 'available') {
-              otherWingAvailable.push(shortName);
+            if (roomWing === oppositeWing && isAvailable) {
+              if (isHuddle) {
+                otherWingHuddle.push(shortName);
+              } else {
+                otherWingConf.push(shortName);
+              }
             }
             continue; // Skip rooms not matching the requested wing
           }
           
-          // API returns "Available"/"Unavailable" with capital letters
-          if (room.reservableStatus.toLowerCase() === 'available') {
-            available.push(shortName);
+          // Categorize by type and availability
+          if (isAvailable) {
+            if (isHuddle) {
+              availableHuddle.push(shortName);
+            } else {
+              availableConf.push(shortName);
+            }
           } else {
-            unavailable.push(shortName);
+            if (isHuddle) {
+              unavailableHuddle.push(shortName);
+            } else {
+              unavailableConf.push(shortName);
+            }
           }
         }
 
         // Sort by proximity to user's desk if available, otherwise alphabetically
-        const sortedAvailable = sortByProximity(available, userDesk);
-        const sortedUnavailable = sortByProximity(unavailable, userDesk);
-        const sortedOtherWing = otherWingAvailable.sort();
-
-        const totalChecked = sortedAvailable.length + sortedUnavailable.length;
+        const sortedAvailableConf = sortByProximity(availableConf, userDesk);
+        const sortedAvailableHuddle = sortByProximity(availableHuddle, userDesk);
+        const sortedUnavailableConf = sortByProximity(unavailableConf, userDesk);
+        const sortedUnavailableHuddle = sortByProximity(unavailableHuddle, userDesk);
+        const sortedOtherWingConf = sortByProximity(otherWingConf, userDesk);
+        const sortedOtherWingHuddle = sortByProximity(otherWingHuddle, userDesk);
 
         // Parse date parts to avoid timezone issues with date display
         const [year, month, day] = date.split('-').map(Number);
         const dateStr = new Date(year, month - 1, day).toLocaleDateString('en-US', { weekday: 'long', month: 'short', day: 'numeric' });
         
-        let output = `📅 **Availability Check**\n`;
-        output += `**Date:** ${dateStr}\n`;
-        output += `**Time:** ${args.startTime} - ${endTime}\n`;
-        if (autoDetectedFloor && userDesk) {
-          output += `**Your desk:** ${userDesk} (auto-detected floor ${floor})\n`;
+        // Helper to extract just room number (e.g., "08E-340" -> "340")
+        const getRoomNum = (name: string) => name.replace(/^\d{2}[EW]-/, '');
+        
+        // Helper to group rooms by wing
+        const groupByWing = (rooms: string[]) => {
+          const east = rooms.filter(r => r.includes('E-')).sort();
+          const west = rooms.filter(r => r.includes('W-')).sort();
+          return { east, west };
+        };
+        
+        const confByWing = groupByWing(sortedAvailableConf);
+        const huddleByWing = groupByWing(sortedAvailableHuddle);
+        
+        // Build output
+        let output = `## 📅 ${dateStr} · ${args.startTime}–${endTime}\n\n`;
+        
+        if (userDesk) {
+          output += `📍 Your desk: **${userDesk}**${autoDetectedFloor ? ' (auto-detected floor)' : ''}\n\n`;
         }
-        output += `**Resources checked:** ${totalChecked}${wingFilter ? ` (filtered to ${floorPattern} only)` : ''}\n\n`;
-
-        if (sortedAvailable.length > 0) {
-          output += `✅ **Available on ${baseFloor}${wingFilter || ''} (${sortedAvailable.length}):**\n`;
-          for (let i = 0; i < sortedAvailable.length; i += 4) {
-            const row = sortedAvailable.slice(i, i + 4).join(' • ');
-            output += `  ${row}\n`;
-          }
+        
+        // Quick summary
+        const totalConf = sortedAvailableConf.length;
+        const totalHuddle = sortedAvailableHuddle.length;
+        const totalUnavailable = sortedUnavailableConf.length + sortedUnavailableHuddle.length;
+        
+        if (totalConf === 0 && totalHuddle === 0) {
+          output += `### 😕 No rooms available on floor ${baseFloor}${wingFilter || ''}\n`;
         } else {
-          output += `😕 **No rooms available on ${baseFloor}${wingFilter || ''}**\n`;
+          output += `### ✅ Available on Floor ${baseFloor}${wingFilter || ''}\n\n`;
+          
+          // Conference Rooms
+          if (totalConf > 0) {
+            output += `**Conference Rooms** (${totalConf})\n`;
+            if (!wingFilter && confByWing.east.length > 0 && confByWing.west.length > 0) {
+              // Show by wing when showing whole floor
+              output += `  East: ${confByWing.east.join(', ')}\n`;
+              output += `  West: ${confByWing.west.join(', ')}\n`;
+            } else {
+              output += `  ${sortedAvailableConf.join(', ')}\n`;
+            }
+            output += '\n';
+          }
+          
+          // Huddle Spaces (show condensed if many)
+          if (totalHuddle > 0) {
+            output += `**Huddle Spaces** (${totalHuddle})\n`;
+            if (totalHuddle <= 8) {
+              output += `  ${sortedAvailableHuddle.join(', ')}\n`;
+            } else {
+              // Show first few with count
+              if (!wingFilter && huddleByWing.east.length > 0 && huddleByWing.west.length > 0) {
+                const showEast = huddleByWing.east.slice(0, 4);
+                const showWest = huddleByWing.west.slice(0, 4);
+                output += `  East: ${showEast.join(', ')}`;
+                if (huddleByWing.east.length > 4) output += ` +${huddleByWing.east.length - 4} more`;
+                output += '\n';
+                output += `  West: ${showWest.join(', ')}`;
+                if (huddleByWing.west.length > 4) output += ` +${huddleByWing.west.length - 4} more`;
+                output += '\n';
+              } else {
+                const showHuddles = sortedAvailableHuddle.slice(0, 6);
+                output += `  ${showHuddles.join(', ')}`;
+                output += ` +${totalHuddle - 6} more\n`;
+              }
+            }
+          }
+        }
+        
+        // Show other wing if limited availability
+        const totalAvailableOnWing = sortedAvailableConf.length + sortedAvailableHuddle.length;
+        if (wingFilter && totalAvailableOnWing <= 3 && (sortedOtherWingConf.length > 0 || sortedOtherWingHuddle.length > 0)) {
+          output += `\n### 🚶 Nearby on ${baseFloor}${oppositeWing}\n`;
+          if (sortedOtherWingConf.length > 0) {
+            output += `  Conf: ${sortedOtherWingConf.slice(0, 4).join(', ')}`;
+            if (sortedOtherWingConf.length > 4) output += ` +${sortedOtherWingConf.length - 4} more`;
+            output += '\n';
+          }
+          if (sortedOtherWingHuddle.length > 0) {
+            output += `  Huddle: ${sortedOtherWingHuddle.slice(0, 4).join(', ')}`;
+            if (sortedOtherWingHuddle.length > 4) output += ` +${sortedOtherWingHuddle.length - 4} more`;
+            output += '\n';
+          }
+        }
+        
+        // Unavailable summary (collapsed)
+        if (totalUnavailable > 0) {
+          output += `\n---\n`;
+          output += `❌ ${totalUnavailable} unavailable (${sortedUnavailableConf.length} conf, ${sortedUnavailableHuddle.length} huddle)\n`;
+        }
+        
+        // Find the closest available room (regardless of type) for booking prompt
+        const allAvailableRooms = [
+          ...sortedAvailableConf,
+          ...sortedAvailableHuddle,
+          ...sortedOtherWingConf,
+          ...sortedOtherWingHuddle,
+        ];
+        const closestRoom = sortByProximity(allAvailableRooms, userDesk)[0];
+        
+        // Find closest huddle specifically (may be same as closestRoom if huddle is closest overall)
+        const allAvailableHuddles = [
+          ...sortedAvailableHuddle,
+          ...sortedOtherWingHuddle,
+        ];
+        const closestHuddle = sortByProximity(allAvailableHuddles, userDesk)[0];
+        
+        if (closestRoom) {
+          const isClosestRoomHuddle = allAvailableHuddles.includes(closestRoom);
+          const roomType = isClosestRoomHuddle ? 'huddle' : 'conference room';
+          
+          output += `\n---\n`;
+          output += `🎯 **Closest available:** ${closestRoom} (${roomType})\n`;
+          
+          // Show closest huddle as alternative if the closest room is a conference room
+          if (!isClosestRoomHuddle && closestHuddle) {
+            output += `🪑 **Closest huddle:** ${closestHuddle}\n`;
+          }
+          
+          output += `\nWould you like me to book **${closestRoom}**? (yes/no/another)`;
         }
 
-        // If few rooms available on user's wing (<= 2), show other wing options
-        if (wingFilter && sortedAvailable.length <= 2 && sortedOtherWing.length > 0) {
-          output += `\n🚶 **Also available on ${baseFloor}${oppositeWing} (${sortedOtherWing.length}):**\n`;
-          for (let i = 0; i < Math.min(sortedOtherWing.length, 8); i += 4) {
-            const row = sortedOtherWing.slice(i, i + 4).join(' • ');
-            output += `  ${row}\n`;
-          }
-          if (sortedOtherWing.length > 8) {
-            output += `  _...and ${sortedOtherWing.length - 8} more_\n`;
-          }
-        }
+        // Generate annotated map if map config is available
+        if (roomConfig.mapConfig && roomConfig.mapConfig.floorMaps[baseFloor]) {
+          try {
+            // Get top recommendations for map (1 of each type, green markers)
+            const topRecommendations = [
+              ...sortedAvailableConf.slice(0, 1),
+              ...sortedAvailableHuddle.slice(0, 1),
+            ];
 
-        if (sortedUnavailable.length > 0) {
-          output += `\n❌ **Unavailable on ${baseFloor}${wingFilter || ''} (${sortedUnavailable.length}):**\n`;
-          for (let i = 0; i < sortedUnavailable.length; i += 4) {
-            const row = sortedUnavailable.slice(i, i + 4).join(' • ');
-            output += `  ${row}\n`;
-          }
-        }
+            // Get additional suggestions (3+ more of each type, yellow markers)
+            const additionalSuggestions = [
+              ...sortedAvailableConf.slice(1, 4),
+              ...sortedAvailableHuddle.slice(1, 4),
+            ];
 
-        const bestAvailable = sortedAvailable[0] || sortedOtherWing[0];
-        if (bestAvailable) {
-          output += `\n💡 _To book: reserve_room with room name "${bestAvailable}"_`;
+            const mapPath = await generateAnnotatedMap({
+              floorPattern: baseFloor,
+              floorId: roomConfig.floorIds![baseFloor],
+              topRecommendations,
+              additionalSuggestions,
+              userDesk: userDesk || undefined,
+              dateStr,
+              timeRange: `${args.startTime}–${endTime}`,
+              mapConfig: roomConfig.mapConfig,
+              token: config.token,
+              host: config.host,
+            });
+
+            if (mapPath) {
+              output += `\n\n---\n📍 **Floor Map:** \`${mapPath}\``;
+            }
+
+            // Cleanup old cached maps in background
+            cleanupOldMaps().catch(() => {});
+          } catch (error) {
+            console.error('Failed to generate map:', error);
+          }
         }
 
         return output;
@@ -1365,7 +1569,7 @@ async function main(): Promise<void> {
         case 'reserve_desk_recurring':
           result = await handleReserveDeskRecurring(args as Parameters<typeof handleReserveDeskRecurring>[0]);
           break;
-        case 'check_availability':
+        case 'check_meeting_availability':
           result = await handleCheckAvailability(args as Parameters<typeof handleCheckAvailability>[0]);
           break;
         default:

@@ -7,3 +7,4 @@ USER_CONFIGS.json
 node_modules/
 mcp-server/node_modules/
 mcp-server/dist/
+mcp-server/cache/

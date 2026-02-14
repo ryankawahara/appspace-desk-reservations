@@ -308,6 +308,7 @@ export class AppspaceClient {
     id: string;
     name: string;
     type: string;
+    subType?: string; // "VideoConferenceRoom", "HuddleSpace", "Desk", etc.
     capacity?: number;
     locationPath?: string;
     reservableStatus: string; // "Available", "Unavailable", or "Checkin"
