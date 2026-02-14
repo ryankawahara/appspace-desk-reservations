@@ -426,6 +426,10 @@ const TOOLS: Tool[] = [
           type: 'string',
           description: 'Optional: Full location prefix to match (e.g., "!CR NYNY 7 HUDSON 08W")',
         },
+        skipMap: {
+          type: 'boolean',
+          description: 'Skip generating the floor map image. Useful for quick availability checks or batch queries.',
+        },
       },
       required: ['startTime'],
     },
@@ -1042,6 +1046,7 @@ async function handleCheckAvailability(args: {
   duration?: number;
   endTime?: string;
   location?: string;
+  skipMap?: boolean;
 }): Promise<string> {
   // Default date to today
   const date = parseDate(args.date || 'today');
@@ -1302,8 +1307,8 @@ async function handleCheckAvailability(args: {
           output += `\nWould you like me to book **${closestRoom}**? (yes/no/another)`;
         }
 
-        // Generate annotated map if map config is available
-        if (roomConfig.mapConfig && roomConfig.mapConfig.floorMaps[baseFloor]) {
+        // Generate annotated map if map config is available (and not skipped)
+        if (!args.skipMap && roomConfig.mapConfig && roomConfig.mapConfig.floorMaps[baseFloor]) {
           try {
             // Get top recommendations for map (1 of each type, green markers)
             const topRecommendations = [
