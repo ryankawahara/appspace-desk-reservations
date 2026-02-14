@@ -2003,8 +2003,10 @@ async function handleCheckAvailability(args: {
             floorGeoData,
           });
           if (textMap) {
-            output += '\n\n---\n**[AGENT: Display the ASCII floor map below EXACTLY as shown - do not modify, summarize, or add annotations to the map]**\n';
+            output += '\n\n---\n';
+            output += '**[CRITICAL AGENT INSTRUCTION: You MUST display the ENTIRE ASCII floor map below in your response. Do NOT truncate, summarize, paraphrase, or omit any part of it. Copy the complete map exactly as shown, preserving all characters and formatting. The user relies on this visual map to locate rooms. Failure to display the full map will result in a poor user experience.]**\n\n';
             output += textMap;
+            output += '\n\n**[END OF MAP - Agent: Confirm you displayed the complete map above without truncation]**';
           }
         }
 
