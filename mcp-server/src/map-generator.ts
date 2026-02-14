@@ -15,6 +15,8 @@ const __dirname = dirname(__filename);
 
 // Cache directory for map images
 const CACHE_DIR = join(__dirname, '..', 'cache');
+// Fallback directory for pre-downloaded floor maps
+const FALLBACK_DIR = join(__dirname, '..', 'fallback');
 
 interface MapConfig {
   cdnBase: string;
@@ -128,7 +130,8 @@ async function fetchFloorSVG(mapConfig: MapConfig, floorPattern: string): Promis
 
     if (!response.ok) {
       console.error(`Failed to fetch floor SVG: ${response.status}`);
-      return null;
+      // Try fallback
+      return await loadFallbackSVG(floorPattern);
     }
 
     const svgContent = await response.text();
@@ -142,8 +145,25 @@ async function fetchFloorSVG(mapConfig: MapConfig, floorPattern: string): Promis
     return svgContent;
   } catch (error) {
     console.error('Error fetching floor SVG:', error);
-    return null;
+    // Try fallback
+    return await loadFallbackSVG(floorPattern);
   }
+}
+
+/**
+ * Load a fallback SVG from the fallback directory
+ */
+async function loadFallbackSVG(floorPattern: string): Promise<string | null> {
+  const fallbackFile = join(FALLBACK_DIR, `floor_${floorPattern}_base.svg`);
+  if (existsSync(fallbackFile)) {
+    try {
+      console.error(`Using fallback SVG for floor ${floorPattern}`);
+      return await readFile(fallbackFile, 'utf-8');
+    } catch (error) {
+      console.error('Error reading fallback SVG:', error);
+    }
+  }
+  return null;
 }
 
 /**
